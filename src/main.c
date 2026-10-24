@@ -5,6 +5,9 @@
 #include <netinet/in.h>
 #include <sys/event.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <errno.h>
 
 #define PORT 6500
 #define MAX_EVENTS 64
@@ -14,11 +17,18 @@ typedef struct sockaddr_in sockaddr_in_t;
 
 static void handle_data_read(const int fd) {
     char buffer[1024];
-    const ssize_t bytes = read(fd, &buffer, sizeof(buffer));
+    const ssize_t bytes = read(fd, &buffer, sizeof(buffer) - 1);
 
-    if (bytes <= 0) {
-        printf("Failed to read from socket\n");
+    if (bytes == 0) {
+        // nothing to read
         close(fd);
+    } else if (bytes < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
+        } else {
+            printf("Failed to read from socket\n");
+            close(fd);
+        }
     } else {
         buffer[bytes] = '\0';
         const char *prefix = "From server: ";
@@ -27,6 +37,15 @@ static void handle_data_read(const int fd) {
         strcat(response, buffer);
         write(fd, response, strlen(response));
     }
+}
+
+static bool set_nonblocking(const int client_fd) {
+    const int flags = fcntl(client_fd, F_GETFL);
+    if (flags == -1 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        printf("Failed to set nonblocking on client.\n");
+        return false;
+    }
+    return true;
 }
 
 int main(void) {
@@ -52,6 +71,12 @@ int main(void) {
 
     // listen for new connections on the socket
     listen(server_fd, 128);
+    if (!set_nonblocking(server_fd)) {
+        printf("Failed to set nonblocking on server. Exiting.\n");
+        close(server_fd);
+        exit(1);
+    }
+
     // create a queue to add incoming connections
     const int queue_fd = kqueue();
     if (queue_fd == -1) {
@@ -72,6 +97,7 @@ int main(void) {
     while (1) {
         const int num_events = kevent(queue_fd, NULL, 0, event_list, MAX_EVENTS, NULL);
         if (num_events == -1) {
+            if (errno == EINTR) continue;
             printf("Failed to get the number of events. Exiting.\n");
             exit(1);
         }
@@ -89,7 +115,17 @@ int main(void) {
                 socklen_t client_address_size = sizeof(client_address);
                 const int client_fd = accept(server_fd, (struct sockaddr *) &client_address, &client_address_size);
                 if (client_fd == -1) {
-                    printf("Failed to accept connection from client. Exiting.\n");
+                    if (errno == ECONNABORTED || errno == EAGAIN || errno == EWOULDBLOCK) {
+                        continue;
+                    }
+                    printf("Failed to accept connection from client. Continuing.\n");
+                    continue;
+                }
+
+                // in an event driven architecture, a single slow read or write
+                // could block the entire event loop, so set socket as non-blocking
+                if (!set_nonblocking(client_fd)) {
+                    close(client_fd);
                     continue;
                 }
 
@@ -97,7 +133,8 @@ int main(void) {
                 kevent_t client_event_config;
                 EV_SET(&client_event_config, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
                 if (kevent(queue_fd, &client_event_config, 1, NULL, 0, NULL) == -1) {
-                    printf("Failed to register event for client. Exiting.\n");
+                    printf("Failed to register event for client.\n");
+                    close(client_fd);
                     continue;
                 }
 
@@ -106,7 +143,7 @@ int main(void) {
                 // since client fd is different from server fd, this means this connection has already
                 // been established and now this change event is basically new data coming onto that connection
                 if (change_event->flags & EV_EOF) {
-                    printf("Client on fd: %d disconnected. Exiting.\n", event_fd);
+                    printf("Client on fd: %d disconnected.\n", event_fd);
                     close(event_fd);
                 } else if (change_event->filter == EVFILT_READ) {
                     handle_data_read(event_fd);
