@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <signal.h>
 
 #define PORT 6500
 #define MAX_EVENTS 64
@@ -35,7 +36,15 @@ static void handle_data_read(const int fd) {
         char response[1100];
         strcpy(response, prefix);
         strcat(response, buffer);
-        write(fd, response, strlen(response));
+        const ssize_t written = write(fd, response, strlen(response));
+        if (written == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
+            } else if (errno == EPIPE) {
+                printf("Failed to write to socket, client disconnected.\n");
+                close(fd);
+            }
+        }
     }
 }
 
@@ -49,6 +58,7 @@ static bool set_nonblocking(const int client_fd) {
 }
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     printf("Starting up the server...\n");
     // init a socket and get the file descriptor assigned
     const int server_fd = socket(PF_INET, SOCK_STREAM, 0);
