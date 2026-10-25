@@ -22,36 +22,61 @@ static void close_connection(connection_t *connection) {
     free(connection);
 }
 
-static void handle_data_read(connection_t *connection) {
-    const int fd = connection->socket_fd;
-    char buffer[1024];
-    const ssize_t bytes = read(fd, &buffer, sizeof(buffer) - 1);
+static const char *status_text(const int status) {
+    switch (status) {
+        case 414: return "URI Too Long";
+        case 431: return "Request Header Fields Too Large";
+        default: return "Bad Request";
+    }
+}
 
+static void send_error(connection_t *connection, const int status) {
+    char response[256];
+    const int length = snprintf(response, sizeof(response),
+                                "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                status, status_text(status));
+    if (length > 0) {
+        write(connection->socket_fd, response, (size_t) length);
+    }
+    close_connection(connection);
+}
+
+static void handle_data_read(connection_t *connection) {
+    if (connection->state == STATE_ERROR) {
+        send_error(connection, connection->error_status ? connection->error_status : 400);
+        return;
+    }
+    if (connection->state == STATE_DONE) {
+        return;
+    }
+
+    // read the data from the socket to the read buffer of connection object and then call parse
+    const size_t space = sizeof(connection->read_buffer) - connection->buffer_length;
+    if (space == 0) {
+        send_error(connection, 431);
+        return;
+    }
+    const ssize_t bytes = read(connection->socket_fd,
+                               connection->read_buffer + connection->buffer_length,
+                               space);
     if (bytes == 0) {
         // nothing to read
         close_connection(connection);
-    } else if (bytes < 0) {
+        return;
+    }
+    if (bytes < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
         } else {
             printf("Failed to read from socket\n");
             close_connection(connection);
         }
-    } else {
-        buffer[bytes] = '\0';
-        const char *prefix = "From server: ";
-        char response[1100];
-        strcpy(response, prefix);
-        strcat(response, buffer);
-        const ssize_t written = write(fd, response, strlen(response));
-        if (written == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
-            } else if (errno == EPIPE) {
-                printf("Failed to write to socket, client disconnected.\n");
-                close_connection(connection);
-            }
-        }
+        return;
+    }
+    connection->buffer_length += (size_t) bytes;
+    parse(connection);
+    if (connection->state == STATE_ERROR) {
+        send_error(connection, connection->error_status ? connection->error_status : 400);
     }
 }
 

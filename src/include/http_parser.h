@@ -22,6 +22,7 @@ typedef struct header_t {
 typedef struct connection_t {
     int socket_fd;
     parser_state_t state;
+    int error_status;
     char read_buffer[4096];
     size_t buffer_length;
     size_t parse_offset;
@@ -36,5 +37,7 @@ typedef struct connection_t {
     size_t content_length;
     size_t body_bytes_read;
 } connection_t;
+
+void parse(connection_t *connection);
 
 #endif
