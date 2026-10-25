@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <signal.h>
+#include "http_parser.h"
 
 #define PORT 6500
 #define MAX_EVENTS 64
@@ -16,19 +17,25 @@
 typedef struct kevent kevent_t;
 typedef struct sockaddr_in sockaddr_in_t;
 
-static void handle_data_read(const int fd) {
+static void close_connection(connection_t *connection) {
+    close(connection->socket_fd);
+    free(connection);
+}
+
+static void handle_data_read(connection_t *connection) {
+    const int fd = connection->socket_fd;
     char buffer[1024];
     const ssize_t bytes = read(fd, &buffer, sizeof(buffer) - 1);
 
     if (bytes == 0) {
         // nothing to read
-        close(fd);
+        close_connection(connection);
     } else if (bytes < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
         } else {
             printf("Failed to read from socket\n");
-            close(fd);
+            close_connection(connection);
         }
     } else {
         buffer[bytes] = '\0';
@@ -42,7 +49,7 @@ static void handle_data_read(const int fd) {
                 printf("Data not available to be read yet or interrupted. Returning back to event loop.\n");
             } else if (errno == EPIPE) {
                 printf("Failed to write to socket, client disconnected.\n");
-                close(fd);
+                close_connection(connection);
             }
         }
     }
@@ -139,12 +146,20 @@ int main(void) {
                     continue;
                 }
 
+                connection_t *connection = calloc(1, sizeof(connection_t));
+                if (connection == NULL) {
+                    printf("Failed to allocate memory for connection. Dropping client.\n");
+                    close(client_fd);
+                    continue;
+                }
+                connection->socket_fd = client_fd;
+                connection->state = STATE_METHOD;
                 // register this client fd with queue for reading
                 kevent_t client_event_config;
-                EV_SET(&client_event_config, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+                EV_SET(&client_event_config, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, connection);
                 if (kevent(queue_fd, &client_event_config, 1, NULL, 0, NULL) == -1) {
                     printf("Failed to register event for client.\n");
-                    close(client_fd);
+                    close_connection(connection);
                     continue;
                 }
 
@@ -154,9 +169,9 @@ int main(void) {
                 // been established and now this change event is basically new data coming onto that connection
                 if (change_event->flags & EV_EOF) {
                     printf("Client on fd: %d disconnected.\n", event_fd);
-                    close(event_fd);
+                    close_connection(change_event->udata);
                 } else if (change_event->filter == EVFILT_READ) {
-                    handle_data_read(event_fd);
+                    handle_data_read(change_event->udata);
                 }
             }
         }
